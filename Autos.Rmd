@@ -1,0 +1,654 @@
+---
+title: "Final Project EDA"
+author: "Darius Kharazi"
+date: "December 6, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(glmnet)
+library(mgcv)
+library(car)
+library(randomForest)
+```
+
+## Exploratory Analysis
+
+We chose to model auto prices using the Autos data. This data comes from a larger Kaggle dataset that was scraped from a German Ebay site. The training data we received contained 2000 car listings with 20 variables each. 
+
+### Understanding the data
+
+Before we can model the relationship between price and the other variables, we need to understand the data in our training set. A summary of the dataset can be found below.
+
+```{r, echo=F}
+# Change the file location to wherever it is on your computer!
+setwd("~/Documents/College_Courses/Senior_Year/STAT 4620/Final Project/")
+load("Autos/train.dat")
+load("Autos/test.dat")
+
+train.df <- data.frame(train)
+test.df <- data.frame(test)
+
+#View(train)
+summary(train)
+```
+
+Immediately we can see that missing labels could be a problem. 220 training entries don't have a vehicleType, 126 entries don't have a model, 128 entries don't have a gearbox listed, 208 entries are missing a fuelType, and 365 entries don't have an answer to notRepairedDamage.
+
+```{r}
+any(is.na(train))
+any(is.na(test))
+```
+
+These missing labels aren't considered NA because their label is an empty string, i.e. "". We should consider renaming these missing labels so we can understand them in the models later. Missing or unknown values are hidden in the data in the form of 0s in the variables for powerPS (horsepower), monthOfRegistration, and price; yearOfRegistration uses year numbers that don't exist (e.g., 8888) to show unknown years, or maybe to indicate the car hasn't been registered yet, but that's a strange way of indicating that. The prices with 0 values could also be a seller's trick to make the car show up first when potential buyers search from lowest to highest price; sellers tend to put the actual price in the description or require interested buyers to contact them for a price. For example, the following entry is listed at 1 Euro, but its name translates to "We buy all Porsche 911 and Mercedes SL R107", which hints that this isn't even referencing a car for sale but someone who wants to buy expensive cars. 
+
+```{r}
+head(train[which(row.names(train)== "125059"),])
+```
+
+ We should try to give the "" entries a label, like "unknown". We might as well translate some of the levels as we go, too.
+
+```{r}
+train$notRepairedDamage = as.factor(ifelse(train$notRepairedDamage == "ja", "yes", ifelse(train$notRepairedDamage == "nein", "no", "unknown")))
+train$gearbox = as.factor(ifelse(train$gearbox == "automatik", "automatic", ifelse(train$gearbox == "manuell", "manual", "unknown")))
+
+# Because factors are strange and there are lots of levels, we need to try another tactic for changing the level names
+vehicleType = sapply(train$vehicleType, as.character)
+vehicleType = ifelse(vehicleType == "", "unknown", vehicleType)
+train$vehicleType = as.factor(vehicleType)
+
+fuelType = sapply(train$fuelType, as.character)
+fuelType = ifelse(fuelType == "", "unknown", fuelType)
+train$fuelType = as.factor(fuelType)
+
+modelName = sapply(train$model, as.character)
+modelName = ifelse(modelName == "", "unknown", modelName)
+train$model = as.factor(modelName)
+
+brands = sapply(train$brand, as.character)
+brands = ifelse(brands == "", "unknown", brands)
+train$brand = as.factor(brands)
+
+summary(train)
+```
+
+It's now easier to see which factor labels were missing.
+
+Based on our knowledge of postal codes and months, we know that postalCode and monthOfRegistration should be considered factors or whole numbers and not continuous values. We know the summary output treats these variables as continuous because they have medians and means instead of levels. In Germany, some postal codes start with 0, which is why it appears that some postal code values are incomplete with only 4 digits. We looked at a map of postal code districts in Germany (picture here: https://en.wikipedia.org/wiki/List_of_postal_codes_in_Germany) and decided to make the postalCode variable more manageable by creating categories based on the first digit of the postal code. 
+
+```{r,warning=F}
+train$postalCodeCluster = NULL
+for(i in 1:length(train$postalCode)){
+  train$postalCodeCluster[i] = floor((train$postalCode[i])/10000)
+}
+train$postalCodeCluster = as.factor(train$postalCodeCluster)
+plot(train$postalCodeCluster, log(train$price), xlab="First digit of postal code", ylab="Log-Price", main="Figure 1. Log Price by Postal Code district")
+```
+
+We used log-price in order to see the changes in means more clearly. The average log-price doesn't change much at all across postal code categories (figure 1). This could be a result of our choice of grouping, but it seems like postalCode doesn't have much of an impact on log-price, so we can most likely leave it out of our model.
+
+The monthOfRegistration doesn't show any patterns of seasonality with respect to log-price, so we can probably ignore that variable, too (figure 2). 
+
+```{r, warning=F, echo=F}
+plot(as.factor(train$monthOfRegistration[which(train$price >= 100)]), log(train$price[which(train$price >= 100)]), xlab="Month of Registration", ylab="Log-Price", main="Figure 2. Log-Price by Month of Registration")
+```
+
+
+We could potentially remove the nrOfPictures variable since none of the 2000 training entries used pictures, so we can't effectively train a model using this variable even if members of the testing dataset had pictures on the webpage. The description file also mentioned that this variable may be a bug in the webcrawler, so we should definitely leave it out of our analysis. Similarly, all postings in this training set appear to be from a private seller (privat) instead of a commercial/dealer seller (gewerblich), and everything had an offerType of "offer" (Angebot) instead of "request" (Gesuch). Therefore, these variables won't be useful to predict the price of a commercial seller or request listing. 
+
+The description file doesn't describe what abtest refers to, but it most likely refers to the design of the website or ad (test vs. control) and doesn't have anything to do with the value of the car. However, it could also refer to ads for the same car but using different prices or design techniques. More analysis is needed, but it seems unlikely to be linked to the actual value of the car.
+
+```{r, echo=F, warning=F}
+par(mfrow=c(1,2))
+plot(train$abtest, train$price, main="Figure 3. ABTest vs. Price")
+plot(train$abtest, log(train$price), main="Figure 4. ABTest vs. Log-Price")
+```
+
+Figure 3 shows that there are lots of outliers in both the control and test abtest levels compared to original price, but we can see in figure 4 that the control and test levels are actually very similar in terms of the log-price, so this variable is unlikely to be useful. 
+
+The continuous variables in this dataset include price, yearOfRegistration, powerPS, and kilometer; with the exception of dates, which should potentially be treated separately, the other variables should be considered factors. Figure 5 shows a pairs plot of all continuous variables.
+
+```{r, echo=F}
+pairs(train[,c(5,8,10,12)], main="Figure 5. Pairs Plot of Continuous Variables")
+```
+
+There appears to be several outliers in the yearOfRegistration variable and potentially within the price variable itself. Most entries appear to have a lower price, but the sparse entries with high prices make it difficult to tell. 
+
+```{r}
+# The number of records with powerPS > 1000
+sum(ifelse(train$powerPS > 1000, 1, 0))
+
+# The number of records with yearOfRegistration > 2018
+sum(ifelse(train$yearOfRegistration > 2018, 1, 0))
+```
+
+Very few vehicles have a powerPS listed above 1000, and even fewer have infeasible yearOfRegistration values. If we remove these values, the pairs plots may look cleaner.
+
+```{r}
+# Removing these entries and viewing the pairs plot in comparison to log-price may make things clearer
+tr_dat = train[which(train$powerPS < 1000),c(5,8,10,12)]
+tr_dat = tr_dat[which(tr_dat$yearOfRegistration <= 2018),]
+tr_dat = data.frame(log(tr_dat$price), tr_dat)
+pairs(tr_dat, main="Figure 6. Pairs Plot with Log-Price (Some Outliers Removed)")
+```
+
+Now powerPS looks fairly linear against log-price but has a slight curve, with just a few data points along log-price = 0 which could be due to the 0 Euro price listings (figure 6). We might consider taking the log of powerPS to smooth out the curvature. 
+
+```{r}
+plot(log(tr_dat$powerPS), tr_dat$log.tr_dat.price., xlab="LogPowerPS", ylab="LogPrice", main="Figure 7. Log PowerPS vs. Log-Price")
+```
+
+As figure 7 shows, taking the logarithm of powerPS results in a more linear relationship with logPrice, but there are still a few outliers to possibly consider. Over 200 entries have a powerPS of 0, which may be a problem where we have to take the log of 0.
+
+monthOfRegistration doesn't look too interesting according to figure 2, but yearOfRegistration could be hiding a relationship. Kilometer also could be relevant, but since we're working with thousands of kilometers, it may be interesting to take the log of kilometers.
+
+```{r, echo=F}
+tr_dat = data.frame(tr_dat, log(tr_dat$powerPS),log(tr_dat$kilometer))
+pairs(tr_dat[which(tr_dat$price > 100),c(1,3,6,7)], main="Figure 8. Pairs Plot with Log-PowerPS and Log-Kilometers")
+```
+
+Figure 8 shows the log-price, yearOfRegistration, log-powerPS, and log-kilometer with the outliers and too-low prices removed. We can see a strange pattern going on between log-price and yearOfRegistration; older cars have a high price, but the price gradually gets lower as time goes on until about 1990 when the price gets as low as we'll allow and more cars are on the market. The log-price to year relationship then turns positive, increasing price as time increases. However, within a few years of 2018, the price starts spanning the entire range of prices, causing a triangular chunk of emptiness to appear in the data. This strange shape may be from the shift from currently available cars to future cars because this data was collected in 2016, which is near the point of the triangle. We also have to consider that fewer cars are old cars, so we can probably consider powerPS to reflect part of the age of the car given regular use. The log-powerPS variable, as noted earlier, looks fairly linear, although there are still a few outliers. Taking the log of kilometer emphasized the disjointness of the original variable since the kilometers traveled were most likely rounded to the nearest 1000 km. Log-kilometer looks less helpful than the original kilometers, so this transformation probably shouldn't persist into the model.
+
+Several potential predictors indicate the presence of too many levels to work with, such as dateCrawled, name, vehicleType, model, brand, dateCreated, and lastSeen.
+
+```{r, eval=F}
+nlevels(train$dateCrawled) # 164590 levels
+nlevels(train$model) # 251 levels
+nlevels(train$name) # 128113 levels
+nlevels(train$vehicleType) # 9 levels
+nlevels(train$brand) # 40 levels
+nlevels(train$dateCreated) #97 levels
+nlevels(train$lastSeen) # 111190 levels
+```
+
+The vehicleType variable has a manageable amount of levels with 9, and brand may be close to working alright, but the others are too unique. The name variable is created by sellers and usually contains the make, model, and potentially important specifications, so each one is incredibly unique. The dates (dateCrawled, dateCreated, and lastSeen) could be condensed to the month or day level to shrink the levels to less than 100. Model is usually important in the car-buying process, but 251 levels may be too many to handle; figure 11 shows that there are differences in the mean log-price by model but this is very difficult to see.
+
+```{r, echo=F}
+tr_dat2 = train[which(train$price >= 100),]
+par(mfrow=c(1,2))
+plot(tr_dat2$vehicleType, log(tr_dat2$price), xlab="Vehicle Type", ylab="Log-Price", main="Figure 9. Log-Price by Vehicle Type")
+plot(tr_dat2$brand, log(tr_dat2$price), xlab="Brand", ylab="Log-Price", main="Figure 10. Log-Price by Brand")
+par(mfrow=c(1,1))
+plot(tr_dat2$model, log(tr_dat2$price), xlab="Model", ylab="Log-Price", main="Figure 11. Log-Price by Model")
+```
+
+Figures 9 and 10 show that there are differences in mean log-price across the different levels of vehicle type and brand, respectively. At 40 levels, brand is already difficult to distinguish all of the different brand names, so the greater amounts of factor levels would be even harder to understand, like in figure 11 with log-price by model.
+
+In order to reduce the number of levels in factors like model and brand, we tried grouping the low-frequency levels together. We wanted to balance the number of levels (which ultimately will be turned into dummy variables) with the frequency of the levels.
+
+```{r,warning=F}
+#str(train)
+brand_counts <- as.data.frame(sort(table(train$brand), decreasing = T))
+brand_counts$percentage <- (brand_counts$Freq/sum(brand_counts$Freq))*100
+brand_counts$cum <- cumsum(brand_counts$percentage)
+#View(brand_counts)
+
+top_brands = brand_counts[1:10, 1]
+brand_groups = as.factor(ifelse(as.character(train$brand) %in% as.character(top_brands), as.character(train$brand), "other"))
+train = data.frame(train, brand_groups)
+plot(train$brand_groups, log(train$price), xlab="Brand(Groups)", ylab="Log-Price", main="Figure 12. Log-Price by Brand Groups")
+```
+
+We chose to keep the top 10 brands as distinct levels because, together, they made up 80% of the data. This left 20% to the "other" category. It's easier to see the different levels now (figure 12), and we can see differences in average price across the brand levels.
+
+```{r, warning=F}
+model_counts <- as.data.frame(sort(table(train$model), decreasing = T))
+model_counts$percentage <- (model_counts$Freq/sum(model_counts$Freq))*100
+model_counts$cum <- cumsum(model_counts$percentage)
+#View(model_counts)
+
+top_models = model_counts[1:24, 1]
+model_groups = as.factor(ifelse(as.character(train$model) %in% as.character(top_models), as.character(train$model), "other"))
+train = data.frame(train, model_groups)
+par(mfrow=c(1,1))
+plot(train$model_groups, log(train$price), xlab="Model (Group)", ylab="Log-Price", main="Figure 13. Log-Price by Model Group")
+```
+
+The models were more difficult to narrow down because 12 levels only make up ~50% of the data, so we needed to use more levels to make up for the lack of frequencies. We ended up choosing the top 24 models because there were at least 20 entries with these model values, which was about 67% of the data. This reduction in factor levels makes it much easier to see the differences among models in average log-price (figure 13).
+
+Other categorical variables include gearbox, fuelType, and notRepairedDamage. Figures 14 through 16 show these variables against the log-price.
+
+```{r, echo=F}
+par(mfrow=c(1,1))
+plot(train$gearbox[which(train$price >= 100)], log(train$price[which(train$price >= 100)]), xlab="Gearbox", ylab="Log-Price", main="Figure 14. Gearbox vs. Log-Price")
+plot(train$notRepairedDamage[which(train$price >= 100)], log(train$price[which(train$price >= 100)]), xlab="NotRepairedDamage", ylab="Log-Price", main="Figure 15. NotRepairedDamage vs. Log-Price")
+plot(train$fuelType[which(train$price >= 100)], log(train$price[which(train$price >= 100)]), xlab="FuelType", ylab="Log-Price", main="Figure 16. FuelType vs. Log-Price")
+```
+
+Figure 14. shows that the mean log-price for automatic gearshifts is higher than manual or unknown gearshifts, and manual gearshifts are slightly more expensive than unknown gearshifts on average. The log-price is higher on average for vehicles without unrepaired damage than for cars that still have unrepaired damage, and the average log-price of the unknown damage is somewhere between the other two levels (figure 15). Figure 16 shows that some of the fuel type levels are represented more than others, but the average log-price appears to still be different across the fuel types. For instance, andere seems to have 1 or fewer instances, but the benzin and unknown levels have a large span and similar average log-prices. The levels for cng and hybrid have higher log-prices on average than the other levels, followed by diesel, then lpg, benzin, unknown, and andere. There really aren't too many instances of cng, andere, hybrid, or lpg compared to the other levels, so we could try grouping andere, cng, hybrid, lpg, and unknown together to give 3 levels.
+
+```{r,warning=F}
+fuelType_group = as.factor(ifelse(as.character(train$fuelType) == "benzin", as.character(train$fuelType), ifelse(as.character(train$fuelType) == "diesel", as.character(train$fuelType), "other")))
+train = data.frame(train, fuelType_group)
+plot(train$fuelType_group, log(train$price), xlab="FuelType Group", ylab="Log-Price", main="Figure 17. Log-Price by FuelType Group")
+```
+
+The average log-price is clearly different across the 3 levels of the grouped fuelType variable (figure 17). This should help reduce the number of dummy variables in the models later.
+
+There could be interactions in the data between the various factors and continuous variables, so we explored different combinations. Figures 18 through 23 show how kilometer looks against log-price when colored by the different levels of factor variables (fuelType_group, brand_groups, model_groups, gearbox, notRepairedDamage, and vehicleType, respectively). Figures 24 through 29 explore the relationship between those same factor variables and log-powerPS. 
+
+```{r}
+# Interactions with Kilometer
+par(mfrow=c(1,2))
+plot(train$kilometer, log(train$price), col=train$fuelType_group, xlab="Kilometer", ylab="Log-Price", main="Figure 18. Kilometer & FuelType Group")
+plot(train$kilometer, log(train$price), col=train$brand_groups, xlab="Kilometer", ylab="Log-Price", main="Figure 19. Kilometer & Brand Group")
+plot(train$kilometer, log(train$price), col=train$model_groups, xlab="Kilometer", ylab="Log-Price", main="Figure 20. Kilometer & Model Group")
+plot(train$kilometer, log(train$price), col=train$gearbox, xlab="Kilometer", ylab="Log-Price", main="Figure 21. Kilometer & Gearbox")
+plot(train$kilometer, log(train$price), col=train$notRepairedDamage, xlab="Kilometer", ylab="Log-Price", main="Figure 22. Kilometer & NotRepairedDamage")
+plot(train$kilometer, log(train$price), col=train$vehicleType, xlab="Kilometer", ylab="Log-Price", main="Figure 23. Kilometer & VehicleType")
+
+# Interactions with powerPS
+plot(log(train$powerPS), log(train$price), col=train$fuelType_group, xlab="Log-PowerPS", ylab="Log-Price", main="Figure 24. Log-PowerPS & FuelType Group")
+plot(log(train$powerPS), log(train$price), col=train$brand_groups, xlab="Log-PowerPS", ylab="Log-Price", main="Figure 25. Log-PowerPS & Brand Group")
+plot(log(train$powerPS), log(train$price), col=train$model_groups, xlab="Log-PowerPS", ylab="Log-Price", main="Figure 26. Log-PowerPS & Model Group")
+plot(log(train$powerPS), log(train$price), col=train$gearbox, xlab="Log-PowerPS", ylab="Log-Price", main="Figure 27. Log-PowerPS & Gearbox")
+plot(log(train$powerPS), log(train$price), col=train$notRepairedDamage, xlab="Log-PowerPS", ylab="Log-Price", main="Figure 28. Log-PowerPS & NotRepairedDamage")
+plot(log(train$powerPS), log(train$price), col=train$vehicleType, xlab="Log-PowerPS", ylab="Log-Price", main="Figure 29. Log-PowerPS & VehicleType")
+```
+
+Visually, it's hard to discern whether certain factor variables have interactions with either kilometer or log-powerPS; there aren't any clear distinctions that would make us think that one variable has influence over another, but it's difficult to see in this 2-dimensional way.
+
+
+### Transformations
+
+We should remove the low-ball prices because they don't reflect the selling price of a car. Also, the German Ebay page this data was retrieved from allows sellers to list cars as "To give away" (free), which might mean the cars are in poor shape, especially based on the current page's pictures. This distinction between selling tactic and car quality might be resolved with a car quality predictor, but that information isn't available. As it stands, the price variable is strongly skewed with a right tail (figure 30). Taking the logarithm of price leads to a normal-looking distribution with a mean around 8; however, there is still a small bump close to 0 (figure 31).
+
+```{r, echo=F}
+par(mfrow=c(1,2))
+hist(train$price, xlab="Price", main="Figure 30. Histogram of Price")
+hist(log(train$price), xlab="Log-Price", main="Figure 31. Histogram of Log-Price")
+```
+
+Removing entries with prices less than 100 Euro removes the bump around 0 from figure 31, leaving us with a nice Guassian curve (figure 32).
+
+```{r, echo=F}
+train2 = train[which(train$price >= 100),]
+train2 = data.frame(train2[,c(1,5,7,8,9,10,12,16,17,20,22,23,24)],log(train2$price), log(train2$powerPS))
+colnames(train2)[14] = "logPrice"
+colnames(train2)[15] = "logPowerPS"
+hist(train2$logPrice, xlab="Log-Price (clean)", main="Figure 32. Log-Price without low prices")
+```
+
+Limiting prices to above 100 Euro only removes 74 entries from our training set (about 3.7%), and this doesn't change the overall summary of the training set too much.
+
+```{r}
+nrow(train2) #1926 rows
+summary(train2)
+```
+
+We should also consider cleaning up some of the date labels, either at the month or day levels, in order to see any patterns like seasonality that might be hidden. The description file indicates that dateCrawled is the date the ad was scraped, dateCreated is the date the ad was created, and lastSeen is the last date the page crawler saw the ad. The relationship between dateCreated and lastSeen might be interesting in terms of how long it took to sell the car, which would require taking the difference between dateCreated and lastSeen. However, this may be unrelated to determining the selling price of the car and be more of a reflection of the sale price.
+
+```{r, echo=TRUE}
+par(mfrow=c(2,2))
+dateCrawl_month = as.factor(format(as.Date(train2$dateCrawled), "%Y-%m"))
+plot(dateCrawl_month, train2$logPrice, main="Figure 33. Month of crawl vs Log-Price")
+
+dateCrawl_day = as.factor(as.Date(train2$dateCrawled, "%Y-%m-%d"))
+plot(dateCrawl_day, train2$logPrice, main="Figure 34. Month/Day of crawl vs Log-Price")
+
+adLength = as.double(difftime(as.Date(train2$lastSeen, "%Y-%m-%d"), as.Date(train2$dateCreated, "%Y-%m-%d"), units="days"))
+#summary(adLength)
+plot(adLength, train2$logPrice, main="Figure 35. Ad length vs. Log-Price", xlab="Number of days ad was online", ylab="Log-Price")
+
+ad_data = data.frame(train2, adLength)
+ad_data = ad_data[which(adLength < 40),]
+plot(ad_data$adLength, ad_data$logPrice, main="Figure 36. Ad length (clean) vs. Log-Price"
+     , xlab = "Number of days ad was online", ylab="Log-Price")
+```
+
+Aggregating the log-price into the month or day the ad was crawled doesn't unveil any hidden patterns since the mean log-price appears very similar across months and days (figures 33 and 34, respectively). The length of time between when the ad was created and the last time the webcrawler saw the ad doesn't seem to have any effect on log-price either, although it looks like most ads were taken down in the first 2 weeks to a month (figures 35 and 36). This leads us to believe that the date variables won't be helpful in predicting price. 
+
+```{r, echo=F}
+train2 = train2[which(train2$powerPS < 1000), c(3,4,5,6,7,8,11,12,13,14,15)]
+train2 = train2[which(train2$yearOfRegistration <= 2018),]
+train2 = train2[,-2] # remove yearOfRegistration
+
+# Final cleaning:
+train2.df <- data.frame(train2)
+
+# Delete zeroes from powerPS
+train2.df <- train2.df[train2.df$powerPS != 0,]
+
+# Delete powerPS variable
+train2.df <- train2.df[,-3]
+
+# Combine "andere" and "other"
+train2.df$model_groups[which(train2.df$model_groups == "andere")] <- "other" #combine variables since same meaning
+
+#data cleaning complete
+train_final <- train2.df
+summary(train_final)
+nrow(train_final)
+```
+
+Removing outliers from powerPS and yearOfRegistration and oddities in the data such as prices of 0 Euro or powerPS of 0, we are left with 1721 entries of the original 2000. 
+
+After the exploration, we decided that the following will be our list of predictors, and our response will be log-price. 
+
+Predictors:
+
+* vehicleType
+
+* gearBox
+
+* logPowerPS
+
+* model_groups
+
+* kilometer 
+
+* fuelType_group
+
+* brand_groups
+
+* notRepairedDamage
+
+
+
+### Test data transformations
+
+For every transformation made to our training set, we should make the same transformations to the test set.
+
+```{r}
+test$notRepairedDamage = as.factor(ifelse(test$notRepairedDamage == "ja", "yes", ifelse(test$notRepairedDamage == "nein", "no", "unknown")))
+test$gearbox = as.factor(ifelse(test$gearbox == "automatik", "automatic", ifelse(test$gearbox == "manuell", "manual", "unknown")))
+
+vehicleType = sapply(test$vehicleType, as.character)
+vehicleType = ifelse(vehicleType == "", "unknown", vehicleType)
+test$vehicleType = as.factor(vehicleType)
+
+fuelType = sapply(test$fuelType, as.character)
+fuelType = ifelse(fuelType == "", "unknown", fuelType)
+test$fuelType = as.factor(fuelType)
+
+modelName = sapply(test$model, as.character)
+modelName = ifelse(modelName == "", "unknown", modelName)
+test$model = as.factor(modelName)
+
+brands = sapply(test$brand, as.character)
+brands = ifelse(brands == "", "unknown", brands)
+test$brand = as.factor(brands)
+
+#str(test)
+brand_groups = as.factor(ifelse(as.character(test$brand) %in% as.character(top_brands), as.character(test$brand), "other"))
+test = data.frame(test, brand_groups)
+
+model_groups = as.factor(ifelse(as.character(test$model) %in% as.character(top_models), as.character(test$model), "other"))
+test = data.frame(test, model_groups)
+
+fuelType_group = as.factor(ifelse(as.character(test$fuelType) == "benzin", as.character(test$fuelType), ifelse(as.character(test$fuelType) == "diesel", as.character(test$fuelType), "other")))
+test = data.frame(test, fuelType_group)
+
+test2 = test[which(test$price >= 100),]
+test2 = data.frame(test2[,c(5,7,8,9,10,12,16,21,22,23)],log(test2$price), log(test2$powerPS))
+colnames(test2)[11] = "logPrice"
+colnames(test2)[12] = "logPowerPS"
+
+test2 = test2[which(test2$powerPS < 1000),]
+test2 = test2[which(test2$yearOfRegistration <= 2018), -1] #remove price (keeping logprice)
+test2 = test2[,-2] # remove yearOfRegistration
+
+# Create data frame for final test dataset
+test2.df <- data.frame(test2)
+
+# Delete zeroes from powerPS
+test2.df <- test2.df[test2.df$powerPS != 0,]
+
+# Delete powerPS variable
+test2.df <- test2.df[,-3]
+
+# Combine "andere" and "other"
+test2.df$model_groups[which(test2.df$model_groups == "andere")] <- "other" #combine variables since same meaning
+
+#data cleaning complete
+test_final <- test2.df
+```
+
+---
+
+## Model Building & Analysis
+
+In order to explore a variety of models for this dataset, we built models with linear regression, ridge regression, Lasso, GAMs, and random forests. The exploratory analysis indicated that the transformed data might fit a linear regression well, so we started there.
+
+### Linear Model
+```{r lm}
+# Fit linear model
+train.lm <- lm(logPrice~., data=train_final)
+summary(train.lm) # R^2 = .69
+
+# ANOVA
+train.anova <- anova(train.lm)
+train.anova
+
+# AIC and BIC
+AIC(train.lm) # 3635
+BIC(train.lm) # 3913
+
+# MSE
+pd <- predict(train.lm, test2.df)
+test.mse <- mean((test_final$logPrice - pd)^2)
+test.mse # MSE = 0.66
+
+```
+
+Residual Plots for Linear Model:
+```{r res}
+# Residual plots
+resf = rstandard(train.lm)
+plot(resf, main="Plot of Residuals")
+plot(predict(train.lm), resf, xlab="Predicted Values from Linear Model", main="Predicted vs. Residuals")
+plot(train_final$kilometer, resf, xlab="Kilometer", main="Kilometer vs. Residuals")
+plot(train_final$logPowerPS, resf, xlab="Log-PowerPS", main="Log-PowerPS vs. Residuals")
+
+# Residual boxplots for categorical variables
+par(mfrow=c(2,2))
+with(train_final,{
+  plot(resf~gearbox)
+  plot(resf~vehicleType)
+  plot(resf~brand_groups)
+  plot(resf~model_groups)
+})
+
+# qq plot:
+par(mfrow=c(1,1))
+qqPlot(resf)
+```
+
+Let {$Y_i : i = 1,...,n$} denote a set of independent RVs denoting the number of automobiles in our sample. We assume $Y_i$ ~ $N(\mu_i,\sigma_i^2)$. Our model for $Y_i$, the price of a certain vehicle $x_i$, is
+
+$Y_i=\beta_0+\beta_1X_i+\beta_2X_i+\beta_3X_i+\beta_4X_i+\beta_5X_i+\beta_6X_i+\beta_7X_i+\epsilon_i$
+
+The R-squared coefficient is 69%, which could be indicating some level of overfitting. After running cross validation against the testing dataset, the model provides an MSE value of 0.66, which is good, but could be improved. Also, the AIC score is 3635, and the BIC score is 3913. These scores will be useful to us once we compare the linear model to additional models.
+
+The residuals seem to be symmetrically distributed for the linear model, tending to cluster more towards the middle of the plot. However, the residual plots indicate a few outliers in the data, which could impact the predictive performance of our model. For example, the model seems to be overestimating the kilometer data at very low values of kilometers. Some of the outliers seem to be coming from data entries that may be incorrectly entered, since these entries generally have zeroes or improbably low estimates entered in all of the continous variables. We are not certain that these points are incorrect, and removing these entries could cause an increase in the overall variance of the model. Therefore, we will decide to keep the entries for now.
+
+The residuals seem to show a decent degree of departure at the tails, but randomly distributed between the more centralized values. Therefore, the qqPlot proves to challenge the normality assumption about the residuals to some degree. However, this could be an issue with the data, since there may be a high degree of noise in these regions where the residuals depart from the linear line. We will continue to improve our linear model by including some degree of smoothing, and investigate additional models to improve the accuracy of our predictions.
+
+
+### Ridge Regression
+
+```{r}
+#get model matrices set y's
+x.train = model.matrix(logPrice~.,train_final)[,-1] 
+y.train = train_final$logPrice
+x.test = model.matrix(logPrice~.,test_final)[,-1] 
+y.test = test_final$logPrice
+
+#observe MSE for many values of lambda
+#set seed to replicate 
+set.seed(3) 
+lambdas=seq(1e-3,300,length=100)
+MSE=rep(0,100)
+for(i in 1:100)
+{
+fit.ridge=glmnet(x.train,y.train,alpha=0,lambda=lambdas[i])
+pred.ridge=predict(fit.ridge,newx=x.test)
+MSE[i]=mean((pred.ridge-y.test)^2)
+}
+plot(lambdas,MSE,xlab=expression(lambda),ylab="Test set MSE")
+
+#cross validation
+ridge.cv = cv.glmnet(x.train,y.train,alpha=0)
+plot(ridge.cv) #plot on log-lambda scale
+plot(ridge.cv$lambda,ridge.cv$cvm,xlim=c(0,300)) #plot on lambda scale
+ridge.lambda.cv = ridge.cv$lambda.min # the minimizing lambda
+
+#fit model 
+fit.ridge = glmnet(x.train,y.train,alpha=0,lambda=ridge.lambda.cv)
+pred.ridge = predict(fit.ridge,newx=x.test)
+```
+
+After running an initial regression model to some success we decided to apply some of our new knowledge by trying Ridge and Lasso Regression. First the data needed to be converted in to model matrices as required by the glmnet package. To begin our Ridge analysis, we observe the MSEs of 100 different lambdas. Notice that the MSE is smaller for the smaller lambda. To get the optimal lambda we run a cross validation. The package outputs a plot on the log lambda scale, but manually we can see the mean cross-validated error follows a similar trend to the MSEs we plotted.
+
+### Lasso
+
+```{r}
+#observe MSE for many values of lambda
+#set seed to replicate 
+set.seed(3) 
+lambdas=seq(1e-3,10,length=100)
+MSE=rep(0,100)
+for(i in 1:100)
+{
+fit.lasso=glmnet(x.train,y.train,alpha=1,lambda=lambdas[i])
+pred.lasso=predict(fit.lasso,newx=x.test)
+MSE[i]=mean((pred.lasso-y.test)^2)
+}
+plot(lambdas,MSE,xlab=expression(lambda),ylab="Test set MSE")
+
+#cross validation
+lasso.cv = cv.glmnet(x.train,y.train,alpha=1)
+plot(lasso.cv) #plot on log-lambda scale
+plot(lasso.cv$lambda,lasso.cv$cvm,xlim=c(0,.7)) #plot on lambda scale 
+lasso.lambda.cv = lasso.cv$lambda.min # the minimizing lambda
+
+#fit model 
+fit.lasso = glmnet(x.train,y.train,alpha=1,lambda=lasso.lambda.cv)
+pred.lasso = predict(fit.lasso,newx=x.test)
+```
+
+We start our Lasso regression by exploring many MSEs, similar to with the Ridge. Notice how the MSE flattens out almost immediately; we can expect a small optimal lambda. Next, we again run a cross validation before attaining our final model. 
+
+Compare Ridge and Lasso
+
+```{r}
+#penalties
+sqrt(sum(coef(fit.ridge)[-1,1]^2))
+sum(abs(coef(fit.lasso)[-1,1]))
+
+#cross validated optimal lambdas
+ridge.lambda.cv
+lasso.lambda.cv
+
+#MSE's
+mean((y.test-pred.ridge)^2) 
+mean((y.test-pred.lasso)^2) 
+
+#Compute R^2 from true and predicted values
+rsquare <- function(true, predicted) {
+  sse <- sum((predicted - true)^2)
+  sst <- sum((true - mean(true))^2)
+  rsq <- 1 - sse / sst
+  
+  return (rsq)
+}
+rsquare(y.test, pred.ridge)
+rsquare(y.test, pred.lasso)
+
+#summary of coefficients
+coef(fit.ridge)
+coef(fit.lasso)
+```
+
+Next we will compare the results of the Ridge and Lasso. The "size" of our Ridge and Lasso regression coefficients given our optimal lambdas are as 2.14 and 7.95 respectively. The cross validated lambdas are quite small, .08 for the Ridge and only .01 for the Lasso. This means that the models introduce a small penalty overall. The MSE's of the models are nearly identical at .662 and .668 as are the R-squared values of .565 and .561. With such small difference in MSE and R-squared we would prefer the Lasso model which reduces the dimensionality. As seen in the coefficient outputs, several of the vehicle types, brands, models, and "other" fuel group are reduced to zero by the Lasso. 
+
+
+### Generalized Additive Model
+
+```{r gams}
+# Find k for continous
+train.gam <- gam(logPrice~s(kilometer, k =-1, bs = "cs"), data=train_final)
+summary(train.gam)
+#gam.check(train.gam) # k = 9
+
+# Find k for continous
+train.gam <- gam(logPrice~s(logPowerPS, k =-1, bs = "cs"), data=train_final)
+summary(train.gam)
+#gam.check(train.gam) # k = 9
+
+# Calculate Gams
+train.gam <- gam(logPrice~s(kilometer,k=9)+s(logPowerPS,k=9)+vehicleType+gearbox+notRepairedDamage+brand_groups+model_groups+fuelType_group, data=train_final)
+summary(train.gam) # R^2 = 69%
+gam.check(train.gam)
+
+# Check AIC and BIC
+AIC(train.gam) # 3545
+BIC(train.gam) # 3881.148
+
+# Calculate MSE
+pd <- predict(train.gam, test2.df)
+test.mse <- mean((test_final$logPrice - pd)^2)
+test.mse # MSE = 0.59
+```
+
+Let {$Y_i : i = 1,...,n$} denote a set of independent RVs denoting the number of automobiles in our sample. We assume $Y_i$ ~ $N(\mu_i,\sigma_i^2)$. Our model for $Y_i$, the price of a certain vehicle $x_i$, is
+
+$Y_i=\sum_{j=1}^2f_jX_i+\sum_{k=1}^6\beta_kX_i$      
+
+where each $f_j$ is a function involving smoothing splines given the appropriate degrees of freedom, k = 9, for each continous predictor, and $\beta_k$ is a coefficient for each categorical predictor.
+
+The R-squared coefficient is 69%, which could be indicating some level of overfitting. After running cross validation against the testing dataset, the model provides an MSE value of 0.59, which is good, but could be improved. Also, the AIC score is 3545, and the BIC score is 3881.148. These scores are generally worse than previous models, but not too different.
+
+The residuals seem to be symmetrically distributed for the GAMs model, tending to cluster more towards the middle of the plot. Similar to the original lienar model, the residual plots indicate a few outliers in the data, which could similarly impact the predictive performance of our model. For example, the model still seems to be overestimating some of the data at very low values for certain variables. Again, some of the outliers seem to be coming from data entries that may be incorrectly entered, since these entries generally have zeroes or improbably low estimates entered in all of the continous variables. We remain uncertain that these points are incorrect, and removing these entries could cause an increase in the overall variance of the model, as well. Therefore, we will still continue to keep the entries, especially since some of the outliers with higher values are emphasized more in this model's residual plots.
+
+The residuals seem to show a high degree of departure at the tails, but are randomly distributed between the more centralized values, but not much. Therefore, the qqPlot proves to challenge the normality assumption about the residuals to a decent degree, especially since the GAMs model has the best accuracy measurements. Since more non-linear models have better MSE's in comparison to linear models, the response seems to have a non-linear relationship with the predictors in our data. After the comparison of models and analysis of the data, it seems that the data possesses a high degree of noise in these regions where the residuals depart from the linear line.
+
+
+
+### Random Forest
+
+```{r}
+#attempt bagging 
+bag.fit = randomForest(logPrice ~ ., data = train_final, mtry = ncol(train_final)-1, ntree = 500, importance = T)
+bag.pred = predict(bag.fit, test_final)
+#m-try
+ncol(train_final)-1
+#mse
+mean((test_final$logPrice - bag.pred)^2)
+#variable importance
+importance(bag.fit) 
+
+#fit a random forest 
+rf.fit = randomForest(logPrice ~ ., data = train_final, mtry = (ncol(train_final)-1)/2, ntree = 500, importance = T)
+rf.pred = predict(rf.fit, test_final)
+#mtry
+(ncol(train_final)-1)/2
+#mse 
+mean((test_final$logPrice - rf.pred)^2)
+#variable importance
+importance(rf.fit)
+
+plot(rf.fit, main="Random Forest Error by Number of Trees")
+plot(rf.pred, test_final$logPrice, xlab="Predicted", ylab="Actual", main="Random Forest Actual LogPrice vs. Predicted LogPrice")
+```
+
+To be even more thorough in our analysis we decided to test out trees and random forests on our data. Due to several of the variables being categorical, there was a chance these types of models could capture some of the interactions between variables that our other methods missed. The tree models yielded poor results and also didn't respond well to pruning so we have left them out of the final report. On the otherhand bagging and random forest did produce some interesting results. First we ran a random forest with mtry = # of predictors (aka bagging). Bagging produced a good MSE of .63. We are also able to view the variable importance and see that the kilometers and log of horsepower were the most important variables in the model. Next we output a random forest with mtry = 4 or half of the predictors. This produced a slightly smaller MSE of .61 with similar variable importance.
+
+
+### Preferred Model
+
+After comparing all of our various models by predictive accuracy (MSE) and complexity, we decided that the GAMs model is our preferred model for predicting the log-price of cars. Our initial exploratory analysis indicated that a linear model may fit best, and at first, the linear regression model performed the best compared to only ridge and lasso. However, after we explored the GAMs model, we saw a reduction in mean squared error of almost 0.07, an increase in adjusted $R^2$ of 0.02, and lower AIC and BIC values over the linear model. The table below shows all of our comparison metrics side by side for the values we were able to calculate. 
+
+| Model   | MSE   | AIC/BIC   | $R^2$|
+| ------- |:-----:|:---------:|:----:|
+| Linear  | 0.663 | 3635/3912 | 0.67 |
+| Ridge   | 0.661 |           | 0.56 |
+| Lasso   | 0.667 |           | 0.57 |
+| GAMs    | 0.596 | 3546/3881 | 0.69 |
+| Bagging | 0.633 |           |      |
+| RF      | 0.618 |           |      |
+
+After testing the data across various models, the level of noise that is observed by our accuracy measurements could potentially be a result of the true model's variance, rather than being a flaw in the model selection process. With that being said, GAMs appears to be the clear winner among our model options and could indicate the existence of potentially better models. It has a decent predictive power, explains the most amount of variance in the data, and is less complex than other models. The residual plots show that it might be missing an important element of the data toward the lower tail especially because we seem to be overestimating the lower prices. Maybe a predictor on overall vehicle quality would capture part of the human decision to set the price online as the sellers did. We might also consider including the yearOfRegistration variable in some way, either in a linear form or as a categorical "old"/"new"/"middle-age" format. Our models assumed part of the car's age would be reflected in the kilometers driven, but it might not be enough. We could make these changes to our models in the future, but we can't account for the large number of irregularities in the data from sellers who either don't list the actual price of the car ("low-ball" prices) or aren't actually selling cars. On websites like Ebay or Craigslist, it's hard to separate the serious listings from the advertising gimmicks. 
+
