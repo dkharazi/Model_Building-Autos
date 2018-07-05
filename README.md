@@ -1,6 +1,8 @@
 ## Introduction
 
-Over 370,000 used cars were scraped from ads with Scrapy by Ebay-Kleinanzeigen. The content of the data is in German, meaning some of the data may need to be translated. *Notice*: The fields 'lastSeen' and 'dateCreated' could be used to estimate how long a car will be at least online before it is sold.
+Over 370,000 used cars were scraped from ads with Scrapy by Ebay-Kleinanzeigen. The content of the data is in German, meaning some of the data may need to be translated.  
+
+*Notice*: The fields 'lastSeen' and 'dateCreated' could be used to estimate how long a car will be at least online before it is sold.
 
 ## Variable Descriptions
 
