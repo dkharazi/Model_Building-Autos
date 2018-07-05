@@ -5,8 +5,10 @@ date: "December 6, 2017"
 output: html_document
 ---
 
+# Load Libraries
+
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
 library(dplyr)
 library(glmnet)
 library(mgcv)
@@ -18,7 +20,7 @@ library(randomForest)
 
 We chose to model auto prices using the Autos data. This data comes from a larger Kaggle dataset that was scraped from a German Ebay site. The training data we received contained 2000 car listings with 20 variables each. 
 
-### Understanding the data
+### Understanding the Data
 
 Before we can model the relationship between price and the other variables, we need to understand the data in our training set. A summary of the dataset can be found below.
 
