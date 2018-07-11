@@ -1,4 +1,4 @@
-## Overview
+Overview
 
 Over 370,000 used cars were scraped from ads with Scrapy by Ebay-Kleinanzeigen. The content of the data is in German, meaning some of the data may need to be translated. The original dataset has been uploaded to [Kaggle](https://www.kaggle.com/), but I've included both the training and testing datasets that were split from the original data on Kaggle. The training and testing datasets are used in this analysis, rather than the autos data found on Kaggle.
 
